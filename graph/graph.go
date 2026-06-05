@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"html/template"
 	"os"
+	"sort"
 	"time"
 )
 
@@ -84,13 +85,43 @@ func Downsample(pts []Point, maxPts int) []Point {
 }
 
 // jsPanel is the JSON shape handed to the page's JavaScript.
+//
+// Y holds pointers so a gap in the data (e.g. the laptop was off) can be
+// emitted as JSON null, which Plotly renders as a break in the line rather
+// than interpolating a fake value across the missing period.
 type jsPanel struct {
-	Title string    `json:"title"`
-	Unit  string    `json:"unit"`
-	Warn  float64   `json:"warn"`
-	Crit  float64   `json:"crit"`
-	X     []string  `json:"x"`
-	Y     []float64 `json:"y"`
+	Title string     `json:"title"`
+	Unit  string     `json:"unit"`
+	Warn  float64    `json:"warn"`
+	Crit  float64    `json:"crit"`
+	X     []string   `json:"x"`
+	Y     []*float64 `json:"y"`
+}
+
+// gapThreshold returns the time delta above which two consecutive samples are
+// considered to span a data gap (daemon was not running) rather than a normal
+// sampling interval. It is derived from the data's own median spacing so it
+// adapts to the configured --interval and to downsampling, then scaled up so
+// ordinary jitter never trips it. Returns 0 when there are too few points to
+// tell, which disables gap detection.
+func gapThreshold(pts []Point) time.Duration {
+	if len(pts) < 3 {
+		return 0
+	}
+	deltas := make([]time.Duration, 0, len(pts)-1)
+	for i := 1; i < len(pts); i++ {
+		if d := pts[i].T.Sub(pts[i-1].T); d > 0 {
+			deltas = append(deltas, d)
+		}
+	}
+	if len(deltas) == 0 {
+		return 0
+	}
+	sort.Slice(deltas, func(i, j int) bool { return deltas[i] < deltas[j] })
+	median := deltas[len(deltas)/2]
+	// Break the line at gaps larger than ~4 typical intervals (a couple of
+	// missed samples is still a continuous line; a long absence is a gap).
+	return 4 * median
 }
 
 // Generate writes the dashboard HTML to path.
@@ -101,9 +132,20 @@ func Generate(path string, panels []Panel, host string, since time.Time) error {
 			continue
 		}
 		jp := jsPanel{Title: p.Title, Unit: p.Unit, Warn: p.Warn, Crit: p.Crit}
-		for _, pt := range p.Data {
+		gap := gapThreshold(p.Data)
+		var last time.Time
+		for i, pt := range p.Data {
+			// Insert a null break when the daemon stopped sampling for a while
+			// (e.g. the laptop was off), so Plotly leaves a gap instead of
+			// drawing an interpolated line across the missing period.
+			if i > 0 && gap > 0 && pt.T.Sub(last) > gap {
+				jp.X = append(jp.X, last.Add(pt.T.Sub(last)/2).Format("2006-01-02 15:04:05"))
+				jp.Y = append(jp.Y, nil)
+			}
+			v := round2(pt.V)
 			jp.X = append(jp.X, pt.T.Format("2006-01-02 15:04:05"))
-			jp.Y = append(jp.Y, round2(pt.V))
+			jp.Y = append(jp.Y, &v)
+			last = pt.T
 		}
 		js = append(js, jp)
 	}
@@ -201,6 +243,7 @@ PANELS.forEach((p, i) => {
   const traces = [{
     x: p.x, y: p.y, mode: 'lines', name: p.title,
     line: { color: C.blue, width: 1.5 },
+    connectgaps: false,
     fill: 'tozeroy', fillcolor: 'rgba(137,180,250,0.08)',
     hovertemplate: '%{x}<br>%{y} ' + p.unit + '<extra></extra>'
   }];
