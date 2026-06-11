@@ -350,6 +350,24 @@ func (r *R) Full(rep sensors.Report) {
 		r.table([]string{"IFACE", "TYPE", "NAME", "LINK", "TEMP", "ST", "ADDRESSES"}, rows)
 	}
 
+	// Audio
+	r.section("Audio")
+	if rep.Audio.Speaker == nil && rep.Audio.Mic == nil {
+		r.dimln("(no audio server / pactl not available)")
+	} else {
+		var rows [][]string
+		for _, e := range []*sensors.AudioEndpoint{rep.Audio.Speaker, rep.Audio.Mic} {
+			if e == nil {
+				continue
+			}
+			rows = append(rows, []string{
+				e.Kind, trunc(orValue(e.Name, "—"), 34), yesNo(e.Detected),
+				r.muteCell(e), volCell(e), r.stateCell(e.Status), e.Reason,
+			})
+		}
+		r.table([]string{"DEVICE", "NAME", "DETECTED", "MUTE", "VOLUME", "ST", "NOTE"}, rows)
+	}
+
 	// Summary
 	r.section("Summary")
 	r.summary(rep)
@@ -394,6 +412,11 @@ func (r *R) summaryLines(rep sensors.Report) []line {
 	for _, n := range rep.NICs {
 		ls = append(ls, line{n.Status, "NIC " + n.Iface, n.Reason, n.Temp})
 	}
+	for _, e := range []*sensors.AudioEndpoint{rep.Audio.Speaker, rep.Audio.Mic} {
+		if e != nil {
+			ls = append(ls, line{e.Status, "Audio " + e.Kind, e.Reason, nil})
+		}
+	}
 	return ls
 }
 
@@ -431,6 +454,37 @@ func (r *R) summary(rep sensors.Report) {
 func (r *R) legend() {
 	r.b.WriteString(fmt.Sprintf("  %stemp scale%s  %s  %scool → hot (each temp colored on its own min→max range)%s\n",
 		r.c.dim, r.c.rst, r.gradBar(24), r.c.dim, r.c.rst))
+}
+
+func yesNo(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// muteCell colors the mute state: green "no" (audible) vs yellow "MUTED".
+func (r *R) muteCell(e *sensors.AudioEndpoint) string {
+	if !e.Detected {
+		return "—"
+	}
+	if !r.o.Color {
+		if e.Muted {
+			return "MUTED"
+		}
+		return "no"
+	}
+	if e.Muted {
+		return r.c.yel + "MUTED" + r.c.rst
+	}
+	return r.c.grn + "no" + r.c.rst
+}
+
+func volCell(e *sensors.AudioEndpoint) string {
+	if e == nil || !e.HasVolume {
+		return "—"
+	}
+	return strconv.Itoa(e.VolumePct) + "%"
 }
 
 func orUnknown(s string) string { return orValue(s, "unknown") }

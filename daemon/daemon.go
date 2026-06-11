@@ -162,6 +162,11 @@ func componentLines(rep sensors.Report) []state.Component {
 	for _, n := range rep.NICs {
 		out = append(out, conv("NIC "+n.Iface, n.Status, n.Reason, n.Temp))
 	}
+	for _, e := range []*sensors.AudioEndpoint{rep.Audio.Speaker, rep.Audio.Mic} {
+		if e != nil {
+			out = append(out, conv("Audio "+e.Kind, e.Status, e.Reason, nil))
+		}
+	}
 	return out
 }
 

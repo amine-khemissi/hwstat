@@ -25,6 +25,8 @@ One numeric time-series is kept per dimension (only those the hardware exposes):
 | `battery_charge` | %    | —    | —    | `…/capacity`                             |
 | `fan_rpm`        | RPM  | —    | —    | hwmon `dell_smm`/`thinkpad`/any tach     |
 | `load1`          | —    | —    | —    | `/proc/loadavg`                          |
+| `speaker_volume` | %    | —    | —    | `pactl` default sink (PipeWire/Pulse)    |
+| `mic_volume`     | %    | —    | —    | `pactl` default source (PipeWire/Pulse)  |
 
 Temperatures come straight from the kernel's **sysfs** (hwmon / thermal), so it
 works **without** `lm_sensors` or `nvidia-smi`. Those, plus `smartctl` (SMART

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -60,6 +61,7 @@ type Report struct {
 	Battery     *BatteryInfo
 	Fans        FanInfo
 	NICs        []NICInfo
+	Audio       AudioInfo
 
 	Load1 float64
 }
@@ -155,6 +157,28 @@ type NICInfo struct {
 	Reason string
 }
 
+// AudioInfo is the default playback (speaker) and capture (mic) endpoints as
+// reported by the PipeWire/PulseAudio server via pactl. Nil endpoints mean the
+// server (or pactl) was not reachable.
+type AudioInfo struct {
+	Speaker *AudioEndpoint
+	Mic     *AudioEndpoint
+}
+
+// AudioEndpoint is one default audio device's user-facing state. Note this is
+// the PipeWire view: it reflects the software mute/volume, not the codec's
+// hardware amp/capture switch (which can be muted even while this shows 100%).
+type AudioEndpoint struct {
+	Kind      string // "Speaker" / "Microphone"
+	Name      string // friendly description, e.g. "Arrow Lake cAVS Speaker"
+	Detected  bool   // a real default endpoint exists (not dummy/auto_null)
+	Muted     bool
+	HasVolume bool
+	VolumePct int
+	Status    Status
+	Reason    string
+}
+
 // Collect gathers a full snapshot. SMART disk health and DIMM details require
 // root (and smartctl / dmidecode); they degrade to NA otherwise.
 func Collect() Report {
@@ -173,6 +197,7 @@ func Collect() Report {
 	r.Battery = collectBattery()
 	r.Fans = collectFans(r.CPU.Temp)
 	r.NICs = collectNICs()
+	r.Audio = collectAudio()
 	return r
 }
 
@@ -201,6 +226,12 @@ func (r Report) Worst() Status {
 	bump(r.Fans.Status)
 	for _, n := range r.NICs {
 		bump(n.Status)
+	}
+	if r.Audio.Speaker != nil {
+		bump(r.Audio.Speaker.Status)
+	}
+	if r.Audio.Mic != nil {
+		bump(r.Audio.Mic.Status)
 	}
 	return worst
 }
@@ -256,6 +287,12 @@ func (r Report) Metrics() map[string]float64 {
 		m["fan_rpm"] = float64(max)
 	}
 	m["load1"] = r.Load1
+	if r.Audio.Speaker != nil && r.Audio.Speaker.HasVolume {
+		m["speaker_volume"] = float64(r.Audio.Speaker.VolumePct)
+	}
+	if r.Audio.Mic != nil && r.Audio.Mic.HasVolume {
+		m["mic_volume"] = float64(r.Audio.Mic.VolumePct)
+	}
 	return m
 }
 
@@ -811,6 +848,120 @@ func collectNICs() []NICInfo {
 		nics = append(nics, n)
 	}
 	return nics
+}
+
+// --------------------------------------------------------------------------
+// Audio (speaker + mic) — via pactl (PipeWire/PulseAudio)
+// --------------------------------------------------------------------------
+
+func collectAudio() AudioInfo {
+	var a AudioInfo
+	if _, err := exec.LookPath("pactl"); err != nil {
+		return a // no pactl: leave both endpoints nil (NA in the views)
+	}
+	a.Speaker = pactlEndpoint("Speaker", "sinks", "get-default-sink", "sink")
+	a.Mic = pactlEndpoint("Microphone", "sources", "get-default-source", "source")
+	return a
+}
+
+// pactlEndpoint resolves the default sink/source and its mute + volume by
+// parsing `pactl list <listType>` for the block whose Name matches the default.
+func pactlEndpoint(kind, listType, defaultCmd, word string) *AudioEndpoint {
+	e := &AudioEndpoint{Kind: kind}
+	def := strings.TrimSpace(pactlOut(defaultCmd))
+	if def == "" || strings.Contains(def, "auto_null") || strings.Contains(def, "dummy") {
+		e.Status, e.Reason = WRN, "no real default "+word+" (no audio device / dummy output)"
+		return e
+	}
+	desc, muted, vol, hasVol, found := parsePactlList(pactlOut("list", listType), def)
+	if !found {
+		e.Status, e.Reason = WRN, "default "+word+" '"+shortNodeName(def)+"' not found in pactl list"
+		return e
+	}
+	e.Detected = true
+	e.Name = desc
+	if e.Name == "" {
+		e.Name = shortNodeName(def)
+	}
+	e.Muted = muted
+	e.VolumePct, e.HasVolume = vol, hasVol
+	volStr := "n/a"
+	if hasVol {
+		volStr = strconv.Itoa(vol) + "%"
+	}
+	if muted {
+		e.Status, e.Reason = OK, "detected, MUTED ("+volStr+")"
+	} else {
+		e.Status, e.Reason = OK, "detected, unmuted ("+volStr+")"
+	}
+	return e
+}
+
+func pactlOut(args ...string) string {
+	out, err := exec.Command("pactl", args...).Output()
+	if err != nil {
+		return ""
+	}
+	return string(out)
+}
+
+var pctRE = regexp.MustCompile(`(\d+)%`)
+
+// parsePactlList scans `pactl list sinks|sources` output for the block whose
+// "Name:" equals want, returning its Description, mute and volume%.
+func parsePactlList(out, want string) (desc string, muted bool, vol int, hasVol, found bool) {
+	var (
+		curName, curDesc, curMute, curVol string
+		inWanted                          bool
+	)
+	finish := func() {
+		if inWanted {
+			desc = strings.TrimSpace(curDesc)
+			muted = strings.EqualFold(strings.TrimSpace(curMute), "yes")
+			if m := pctRE.FindStringSubmatch(curVol); m != nil {
+				if v, err := strconv.Atoi(m[1]); err == nil {
+					vol, hasVol = v, true
+				}
+			}
+			found = true
+		}
+	}
+	sc := bufio.NewScanner(strings.NewReader(out))
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		trimmed := strings.TrimSpace(line)
+		// A new block header ("Sink #N" / "Source #N") starts at column 0.
+		if line != "" && line[0] != ' ' && line[0] != '\t' {
+			finish()
+			if found {
+				return
+			}
+			curName, curDesc, curMute, curVol, inWanted = "", "", "", "", false
+			continue
+		}
+		switch {
+		case strings.HasPrefix(trimmed, "Name:"):
+			curName = strings.TrimSpace(strings.TrimPrefix(trimmed, "Name:"))
+			inWanted = curName == want
+		case strings.HasPrefix(trimmed, "Description:"):
+			curDesc = strings.TrimSpace(strings.TrimPrefix(trimmed, "Description:"))
+		case strings.HasPrefix(trimmed, "Mute:"):
+			curMute = strings.TrimSpace(strings.TrimPrefix(trimmed, "Mute:"))
+		case strings.HasPrefix(trimmed, "Volume:") && curVol == "":
+			curVol = trimmed
+		}
+	}
+	finish()
+	return
+}
+
+// shortNodeName trims the long ALSA node name to its last dotted segment.
+func shortNodeName(s string) string {
+	if i := strings.LastIndexByte(s, '.'); i >= 0 && i < len(s)-1 {
+		return s[i+1:]
+	}
+	return s
 }
 
 func ifaceAddrs(iface string) string {

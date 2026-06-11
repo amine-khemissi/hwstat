@@ -32,6 +32,8 @@ var All = []Dim{
 	{Key: "battery_charge", Label: "Battery charge", Unit: "%", GMin: 0, GMax: 100},
 	{Key: "fan_rpm", Label: "Fan speed", Unit: "RPM", GMin: 0, GMax: 6000},
 	{Key: "load1", Label: "Load average (1m)", Unit: "", GMin: 0, GMax: 8},
+	{Key: "speaker_volume", Label: "Speaker volume", Unit: "%", GMin: 0, GMax: 100},
+	{Key: "mic_volume", Label: "Mic volume", Unit: "%", GMin: 0, GMax: 100},
 }
 
 // CSVFile returns the per-dimension CSV file name (no directory).
